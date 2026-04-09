@@ -843,6 +843,19 @@ func gcFlushBgCredit(scanWork int64) {
 		return
 	}
 
+	// If the assist queue lock is contended, don't pile on.
+	// Flush credit to the global pool and get back to scanning.
+	// Mutators in gcAssistAlloc can steal from the global pool,
+	// and goroutines entering gcParkAssist will see the credit
+	// and retry instead of parking. A subsequent gcFlushBgCredit
+	// call that finds the lock uncontended will wake alreayd parked
+	// goroutines using both its own credit and the accumulated
+	// global credit
+	if mutexContended(&work.assistQueue.lock) {
+		gcController.bgScanCredit.Add(scanWork)
+		return
+	}
+
 	assistBytesPerWork := gcController.assistBytesPerWork.Load()
 	scanBytes := int64(float64(scanWork) * assistBytesPerWork)
 
@@ -872,6 +885,39 @@ func gcFlushBgCredit(scanWork int64) {
 			// substantially delay small assists.
 			work.assistQueue.q.pushBack(gp)
 			break
+		}
+	}
+
+	if !work.assistQueue.q.empty() {
+		// racy with gcAssistAlloc's steal of
+		// bgScanCredit, same as the steal documented theer
+		var extraCredit int64
+		for {
+			v := gcController.bgScanCredit.Load()
+			if v <= 0 {
+				break
+			}
+			if gcController.bgScanCredit.CompareAndSwap(v, 0) {
+				extraCredit = v
+				break
+			}
+		}
+		extraBytes := int64(float64(extraCredit) * assistBytesPerWork)
+		for !work.assistQueue.q.empty() && extraBytes > 0 {
+			gp := work.assistQueue.q.pop()
+			if extraBytes+gp.gcAssistBytes >= 0 {
+				extraBytes += gp.gcAssistBytes
+				gp.gcAssistBytes = 0
+				ready(gp, 0, false)
+			} else {
+				gp.gcAssistBytes += extraBytes
+				extraBytes = 0
+				work.assistQueue.q.pushBack(gp)
+				break
+			}
+		}
+		if extraBytes > 0 {
+			scanBytes += extraBytes
 		}
 	}
 
